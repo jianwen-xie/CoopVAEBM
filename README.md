@@ -27,7 +27,7 @@ python main.py --test False
 ```bash
 python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'
 ```
-<p align="center"><img src="/examples/syn.png" width="700px"/></p>
+<p align="center"><img src="/demo/syn.png" width="700px"/></p>
 
 ## Exp 3: Interpolation with a pretrained model
 
@@ -36,7 +36,7 @@ python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifa
 python main.py --test True --test_type 'inter' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'
 ```
 
-<p align="center"><img src="/examples/inter.png" width="700px"/></p>
+<p align="center"><img src="/demo/inter.png" width="700px"/></p>
 
 ## References
     @inproceedings{xie2021learning,

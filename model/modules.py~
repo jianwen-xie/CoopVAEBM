@@ -1,0 +1,1435 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+import time
+from six.moves import xrange
+
+from model.utils.interpolate import *
+from model.utils.custom_ops import *
+from model.utils.data_io import DataSet, saveSampleResults
+from model.utils.parzen_ll import ParsenDensityEsimator
+from model.utils.inception_model import *
+from model.utils.cifar_loader import CifarDataset
+import scipy.io as sio
+
+
+class CoopNets(object):
+    def __init__(self, num_epochs=200, image_size=64, batch_size=100, nTileRow=12, nTileCol=12,
+                 descriptor_type='SA', generator_type='SA', encoder_type='SA',
+                 d_lr=0.001, vae_lr=0.0001, beta1_vae=0.5, beta1_des=0.5,
+                 des_step_size=0.002, des_sample_steps=10, des_refsig=0.016,
+                 gen_step_size=0.1, gen_sample_steps=0, gen_refsig=0.3, gen_latent_size=100, weight_latent_loss =2.2,
+                 data_path='./data/', log_step=10, category='volcano',
+                 sample_dir='./synthesis', model_dir='./checkpoints', log_dir='./log', test_dir='./test',
+                 prefetch=True, read_len=500, output_dir='', calculate_inception=False, calculate_parzen=False):
+        self.descriptor_type = descriptor_type
+        self.generator_type = generator_type
+        self.encoder_type = encoder_type
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.image_size = image_size
+        self.nTileRow = nTileRow
+        self.nTileCol = nTileCol
+        self.num_chain = nTileRow * nTileCol
+        self.beta1_des = beta1_des
+        self.beta1_vae = beta1_vae
+        self.prefetch = prefetch
+        self.read_len = read_len
+        self.category = category
+        self.num_channel = 3
+        self.calculate_inception = calculate_inception
+        self.calculate_parzen = calculate_parzen
+        self.output_dir = output_dir
+
+        self.weight_latent_loss = weight_latent_loss
+
+        self.d_lr = d_lr
+        #self.g_lr = g_lr
+        self.vae_lr = vae_lr
+        self.delta1 = des_step_size
+        self.sigma1 = des_refsig
+        self.delta2 = gen_step_size
+        self.sigma2 = gen_refsig
+        self.t1 = des_sample_steps
+        self.t2 = gen_sample_steps
+
+        self.data_path = data_path
+        self.log_step = log_step
+
+        self.log_dir = log_dir
+        self.sample_dir = sample_dir
+        self.model_dir = model_dir
+        self.test_dir = test_dir
+        self.z_size = gen_latent_size
+
+        self.syn = tf.placeholder(shape=[None, self.image_size, self.image_size, self.num_channel], dtype=tf.float32, name='syn')
+        self.obs = tf.placeholder(shape=[None, self.image_size, self.image_size, self.num_channel], dtype=tf.float32, name='obs')
+        self.z = tf.placeholder(shape=[None, self.z_size], dtype=tf.float32, name='z')
+
+        self.debug = False
+
+    def build_model(self):
+
+        global_step = tf.Variable(-1, trainable=False)
+        self.decayed_learning_rate_d = tf.train.exponential_decay(self.d_lr, global_step, 40, 1, staircase=True)
+        #self.decayed_learning_rate_d = self.d_lr
+        self.decayed_learning_rate_vae = tf.train.exponential_decay(self.vae_lr, global_step, 40, 1, staircase=True)
+        #self.decayed_learning_rate_vae = self.vae_lr
+        self.update_lr = tf.assign_add(global_step, 1)
+
+        self.gen_res = self.generator(self.z, reuse=False)
+        obs_res = self.descriptor(self.obs, reuse=False)
+        syn_res = self.descriptor(self.syn, reuse=True)
+
+        self.code, self.mn, self.std = self.encoder(self.syn, reuse=False)
+        self.AE_res = self.generator(self.code, reuse=True)
+
+        # VAE loss
+        #vae_recon_loss = tf.reduce_sum(tf.squared_difference(self.AE_res, self.obs), 1)
+        diff = tf.reshape(tf.square(self.AE_res-self.obs), [-1, self.num_channel * self.image_size * self.image_size])
+        vae_recon_loss = tf.reduce_sum(diff, 1)
+        #vae_recon_loss = tf.reduce_sum(tf.square(self.AE_res-self.obs), axis=1)
+
+        vae_latent_loss = -0.5 * tf.reduce_sum(1.0 + 2.0 * self.std - tf.square(self.mn) - tf.exp(2.0 * self.std), 1)
+        self.vae_loss = tf.reduce_mean(vae_recon_loss + self.weight_latent_loss * vae_latent_loss)
+
+        self.vae_loss_mean, self.vae_loss_update = tf.contrib.metrics.streaming_mean(self.vae_loss)
+        vae_vars = [var for var in tf.trainable_variables() if var.name.startswith('VAE')]
+        vae_optim = tf.train.AdamOptimizer(self.decayed_learning_rate_vae, beta1=self.beta1_vae)
+
+        vae_grads_vars = vae_optim.compute_gradients(self.vae_loss, var_list=vae_vars)
+        vae_grads = [tf.reduce_mean(tf.abs(grad)) for (grad, var) in vae_grads_vars if '/w' in var.name]
+        # update by mean of gradients
+        self.apply_vae_grads = vae_optim.apply_gradients(vae_grads_vars)
+
+
+        self.recon_err = tf.reduce_mean(
+            tf.pow(tf.subtract(tf.reduce_mean(self.syn, axis=0), tf.reduce_mean(self.obs, axis=0)), 2))
+        self.recon_err_mean, self.recon_err_update = tf.contrib.metrics.streaming_mean(self.recon_err)
+
+        # descriptor variables
+        des_vars = [var for var in tf.trainable_variables() if var.name.startswith('des')]
+
+        self.des_loss = tf.subtract(tf.reduce_mean(syn_res, axis=0), tf.reduce_mean(obs_res, axis=0))
+        self.des_loss_mean, self.des_loss_update = tf.contrib.metrics.streaming_mean(self.des_loss)
+
+        des_optim = tf.train.AdamOptimizer(self.decayed_learning_rate_d, beta1=self.beta1_des)
+        des_grads_vars = des_optim.compute_gradients(self.des_loss, var_list=des_vars)
+        des_grads = [tf.reduce_mean(tf.abs(grad)) for (grad, var) in des_grads_vars if '/w' in var.name]
+        # update by mean of gradients
+        self.apply_d_grads = des_optim.apply_gradients(des_grads_vars)
+
+        # generator variables
+        # gen_vars = [var for var in tf.trainable_variables() if var.name.startswith('gen')]
+
+        # self.gen_loss = tf.reduce_mean(1.0 / (2 * self.sigma2 * self.sigma2) * tf.square(self.obs - self.gen_res),
+        #                               axis=0)
+        # print(self.gen_loss)
+        # self.gen_loss_mean, self.gen_loss_update = tf.contrib.metrics.streaming_mean(self.gen_loss)
+
+        #gen_optim = tf.train.AdamOptimizer(self.g_lr, beta1=self.beta1_gen)
+        #gen_grads_vars = gen_optim.compute_gradients(self.gen_loss, var_list=gen_vars)
+        #gen_grads = [tf.reduce_mean(tf.abs(grad)) for (grad, var) in gen_grads_vars if '/w' in var.name]
+        #self.apply_g_grads = gen_optim.apply_gradients(gen_grads_vars)
+
+
+
+        # symbolic langevins
+        self.langevin_descriptor = self.langevin_dynamics_descriptor(self.syn)
+        self.langevin_generator = self.langevin_dynamics_generator(self.z)
+
+        tf.summary.scalar('des_loss', self.des_loss_mean)
+        tf.summary.scalar('vae_loss', self.vae_loss_mean)
+        #tf.summary.scalar('gen_loss', self.gen_loss_mean)
+        #tf.summary.scalar('recon_err', self.recon_err_mean)
+
+        self.summary_op = tf.summary.merge_all()
+
+    def langevin_dynamics_descriptor(self, syn_arg):
+        def cond(i, syn):
+            return tf.less(i, self.t1)
+
+        def body(i, syn):
+            noise = tf.random_normal(shape=[self.num_chain, self.image_size, self.image_size, self.num_channel], name='noise')
+            syn_res = self.descriptor(syn, reuse=True)
+            grad = tf.gradients(syn_res, syn, name='grad_des')[0]
+            syn = syn - 0.5 * self.delta1 * self.delta1 * (syn / self.sigma1 / self.sigma1 - grad) + self.delta1 * noise
+            #syn = syn - 0.5 * self.delta1 * self.delta1 * (syn / self.sigma1 / self.sigma1 - grad)
+            return tf.add(i, 1), syn
+
+        with tf.name_scope("langevin_dynamics_descriptor"):
+            i = tf.constant(0)
+            i, syn = tf.while_loop(cond, body, [i, syn_arg])
+            return syn
+
+    def langevin_dynamics_generator(self, z_arg):
+        def cond(i, z):
+            return tf.less(i, self.t2)
+
+        def body(i, z):
+            noise = tf.random_normal(shape=[self.num_chain, self.z_size], name='noise')
+
+            gen_res = self.generator(z, reuse=True)
+            gen_loss = tf.reduce_mean(1.0 / (2 * self.sigma2 * self.sigma2) * tf.square(self.obs - gen_res),
+                                       axis=0)
+            grad = tf.gradients(gen_loss, z, name='grad_gen')[0]
+            z = z - 0.5 * self.delta2 * self.delta2 * (z + grad) + self.delta2 * noise
+            return tf.add(i, 1), z
+
+        with tf.name_scope("langevin_dynamics_generator"):
+            i = tf.constant(0)
+            i, z = tf.while_loop(cond, body, [i, z_arg])
+            return z
+
+    def langevin_dynamics_generator_recovery(self, z_arg, visible_map):
+        def cond(i, z):
+            return tf.less(i, 30000)
+
+        def body(i, z):
+            noise = tf.random_normal(shape=[self.num_chain, self.z_size], name='noise')
+
+            gen_res = self.generator(z, reuse=True)
+            gen_loss = tf.reduce_mean(1.0 / (2 * self.sigma2 * self.sigma2) * visible_map *(tf.square(self.obs - gen_res)), axis=0)
+            #gen_loss = tf.reduce_mean( visible_map * (tf.square(self.obs - gen_res)), axis=0)
+            grad = tf.gradients(gen_loss, z, name='grad_gen')[0]
+            z = z - 0.5 * self.delta2 * self.delta2 * (z + grad) + self.delta2 * noise
+            #z = z - 50 *  grad
+            return tf.add(i, 1), z
+
+        with tf.name_scope("langevin_dynamics_generator"):
+            i = tf.constant(0)
+            i, z = tf.while_loop(cond, body, [i, z_arg])
+            return z
+
+    def train(self, sess):
+
+        self.build_model()
+
+        # Prepare training data
+        is_mnist = False
+        #dataset = DataSet(self.data_path, image_size=self.image_size, batch_sz=self.batch_size,
+        #                  prefetch=self.prefetch, read_len=self.read_len, is_mnist=is_mnist)
+
+        dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
+                               batch_sz=self.batch_size, max_dataset_size=float('inf'))
+
+        # initialize training
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+
+        sample_results_des = np.random.randn(self.num_chain * dataset.num_batch, self.image_size, self.image_size, self.num_channel)
+        sample_results_gen = np.random.randn(self.num_chain * dataset.num_batch, self.image_size, self.image_size, self.num_channel)
+
+        saver = tf.train.Saver(max_to_keep=4)
+
+        writer = tf.summary.FileWriter(self.log_dir, sess.graph)
+
+        # measure 1: Parzon-window based likelihood
+        if self.calculate_parzen:
+
+            kde = ParsenDensityEsimator(sess)
+            parzon_des_mean_list, parzon_des_se_list = [], []
+            parzon_gen_mean_list, parzon_gen_se_list = [], []
+            parzon_log_file = os.path.join(self.output_dir, 'parzon.txt')
+            parzon_write_file = os.path.join(self.output_dir, 'parzon.mat')
+            parzon_syn_data_file = os.path.join(self.output_dir, 'parzon_syn_dat.mat')
+            parzon_max = -10000
+
+        # measure 2: inception score
+        if self.calculate_inception:
+            inception_log_file = os.path.join(self.output_dir, 'inception.txt')
+            inception_write_file = os.path.join(self.output_dir, 'inception.mat')
+
+        # make graph immutable
+        tf.get_default_graph().finalize()
+
+        # store graph in protobuf
+        with open(self.model_dir + '/graph.proto', 'w') as f:
+            f.write(str(tf.get_default_graph().as_graph_def()))
+
+        inception_mean, inception_sd = [], []
+
+        # train
+        minibatch = -1
+
+        for epoch in xrange(self.num_epochs):
+
+            start_time = time.time()
+            sess.run(self.update_lr)
+
+            for i in xrange(dataset.num_batch):
+                minibatch = minibatch + 1
+                obs_data = dataset.get_batch()
+
+                # Step G0: generate X ~ N(0, 1)
+                z_vec = np.random.randn(self.num_chain, self.z_size)
+                g_res = sess.run(self.gen_res, feed_dict={self.z: z_vec})
+                # Step D1: obtain synthesized images Y
+                if self.t1 > 0:
+                    syn = sess.run(self.langevin_descriptor, feed_dict={self.syn: g_res})
+                # Step G1: update X using Y as training image
+                #if self.t2 > 0:
+                #    z_vec = sess.run(self.langevin_generator, feed_dict={self.z: z_vec, self.obs: syn})
+
+                # variational inference
+
+
+                # Step D2: update D net
+                d_loss = sess.run([self.des_loss, self.des_loss_update, self.apply_d_grads],
+                                  feed_dict={self.obs: obs_data, self.syn: syn})[0]
+
+                # Step G2: update VAE net
+                vae_loss = sess.run([self.vae_loss, self.vae_loss_update, self.apply_vae_grads],
+                                  feed_dict={self.obs: syn, self.syn: syn})[0]
+
+
+                # Step G2: update G net
+                #g_loss = sess.run([self.gen_loss, self.gen_loss_update, self.apply_g_grads],
+                #                  feed_dict={self.obs: syn, self.z: z_vec})[0]
+
+                # Compute MSE
+                mse = sess.run([self.recon_err, self.recon_err_update],
+                               feed_dict={self.obs: obs_data, self.syn: syn})[0]
+
+                sample_results_gen[i * self.num_chain:(i + 1) * self.num_chain] = g_res
+                sample_results_des[i * self.num_chain:(i + 1) * self.num_chain] = syn
+
+
+            end_time = time.time()
+            #[des_loss_avg, gen_loss_avg, mse_avg, summary] = sess.run([self.des_loss_mean, self.gen_loss_mean,
+            #                                                           self.recon_err_mean, self.summary_op])
+
+            [des_loss_avg, vae_loss_avg, mse_avg, summary] = sess.run([self.des_loss_mean, self.vae_loss_mean,
+                                                                       self.recon_err_mean, self.summary_op])
+
+            [decayed_lr_d, decayed_lr_vae] = sess.run([self.decayed_learning_rate_d, self.decayed_learning_rate_vae])
+
+            writer.add_summary(summary, minibatch)
+            writer.flush()
+            print('Epoch #{:d}, avg.des loss: {:.4f}, avg.vae loss: {:.4f}, '
+                  'avg.L2 dist: {:4.4f}, time: {:.2f}s, learning rate: EBM {:.6f}, VAE {:.6f}'.format(epoch, des_loss_avg, vae_loss_avg,
+                  mse_avg, end_time - start_time, decayed_lr_d, decayed_lr_vae))
+
+            #print('Epoch #{:d}, avg.des loss: {:.4f}, avg.vae loss: {:.4f}, '
+            #      'avg.L2 dist: {:4.4f}, time: {:.2f}s'.format(epoch, des_loss_avg, vae_loss_avg,
+            #      mse_avg, end_time - start_time))
+
+            # save synthesis images
+            if not os.path.exists(self.sample_dir):
+                os.makedirs(self.sample_dir)
+            saveSampleResults(syn, "%s/des_%06d_%06d.png" % (self.sample_dir, epoch, minibatch), col_num=self.nTileCol)
+            saveSampleResults(g_res, "%s/gen_%06d_%06d.png" % (self.sample_dir, epoch, minibatch), col_num=self.nTileCol)
+
+            if epoch % self.log_step == 0:
+                # save check points
+                if not os.path.exists(self.model_dir):
+                    os.makedirs(self.model_dir)
+                saver.save(sess, "%s/%s" % (self.model_dir, 'model.ckpt'), global_step=epoch)
+
+            if self.calculate_inception and epoch % 20 == 0:
+
+                sample_results_partial = sample_results_des[:len(dataset)]
+                sample_results_partial = np.minimum(1, np.maximum(-1, sample_results_partial))
+                sample_results_partial = (sample_results_partial + 1) / 2 * 255
+
+                m, s = get_inception_score(sample_results_partial)
+                print("Inception score: mean {}, sd {}".format(m, s))
+                fo = open(inception_log_file, 'a')
+                fo.write("Epoch {}: mean {}, sd {} \n".format(epoch, m, s))
+                fo.close()
+                inception_mean.append(m)
+                inception_sd.append(s)
+                sio.savemat(inception_write_file, {'mean': np.asarray(inception_mean), 'sd': np.asarray(inception_sd)})
+
+            if self.calculate_parzen:
+
+                samples_des = sample_results_des[:10000]
+                samples_gen = sample_results_gen[:10000]
+
+                parzon_des_mean, parzon_des_se, parzon_gen_mean, parzon_gen_se = kde.eval_parzen(samples_des, samples_gen)
+
+                parzon_des_mean_list.append(parzon_des_mean)
+                parzon_des_se_list.append(parzon_des_se)
+                parzon_gen_mean_list.append(parzon_gen_mean)
+                parzon_gen_se_list.append(parzon_gen_se)
+
+                if parzon_des_mean > parzon_max:
+                    parzon_max = parzon_des_mean
+                    sio.savemat(parzon_syn_data_file, {'samples_des': samples_des, 'samples_gen': samples_gen})
+
+                fo = open(parzon_log_file, 'a')
+                fo.write("Epoch {}: des mean {}, sd {}; gen mean {}, sd {}, max score {}. \n".
+                         format(epoch, parzon_des_mean, parzon_des_se, parzon_gen_mean, parzon_gen_se, parzon_max))
+                fo.close()
+
+                sio.savemat(parzon_write_file, {'parzon_des_mean': np.asarray(parzon_des_mean_list),
+                                                'parzon_des_se': np.asarray(parzon_des_se_list),
+                                                'parzon_gen_mean': np.asarray(parzon_gen_mean_list),
+                                                'parzon_gen_se': np.asarray(parzon_gen_se_list)})
+
+
+    def train_finetune(self, sess, ckpt):
+
+        assert ckpt is not None, 'no checkpoint provided.'
+
+        self.build_model()
+
+        saver = tf.train.Saver(max_to_keep=4)
+
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+
+        saver.restore(sess, ckpt)
+        print('Loading checkpoint {}.'.format(ckpt))
+
+
+        # Prepare training data
+        is_mnist = False
+        dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
+                               batch_sz=self.batch_size, max_dataset_size=float('inf'))
+
+        # initialize training
+
+        sample_results_des = np.random.randn(self.num_chain * dataset.num_batch, self.image_size, self.image_size, self.num_channel)
+        sample_results_gen = np.random.randn(self.num_chain * dataset.num_batch, self.image_size, self.image_size, self.num_channel)
+
+
+
+        writer = tf.summary.FileWriter(self.log_dir, sess.graph)
+
+        # measure 1: Parzon-window based likelihood
+        if self.calculate_parzen:
+
+            kde = ParsenDensityEsimator(sess)
+            parzon_des_mean_list, parzon_des_se_list = [], []
+            parzon_gen_mean_list, parzon_gen_se_list = [], []
+            parzon_log_file = os.path.join(self.output_dir, 'parzon.txt')
+            parzon_write_file = os.path.join(self.output_dir, 'parzon.mat')
+            parzon_syn_data_file = os.path.join(self.output_dir, 'parzon_syn_dat.mat')
+            parzon_max = -10000
+
+        # measure 2: inception score
+        if self.calculate_inception:
+            inception_log_file = os.path.join(self.output_dir, 'inception.txt')
+            inception_write_file = os.path.join(self.output_dir, 'inception.mat')
+
+        # make graph immutable
+        #tf.get_default_graph().finalize()
+
+        # store graph in protobuf
+        #with open(self.model_dir + '/graph.proto', 'w') as f:
+        #    f.write(str(tf.get_default_graph().as_graph_def()))
+
+        inception_mean, inception_sd = [], []
+
+        # train
+        minibatch = -1
+
+        #sess.run(self.init_global_step)
+
+        for epoch in xrange(self.num_epochs):
+
+            start_time = time.time()
+            sess.run(self.update_lr)
+
+            for i in xrange(dataset.num_batch):
+                minibatch = minibatch + 1
+                obs_data = dataset.get_batch()
+
+                # Step G0: generate X ~ N(0, 1)
+                z_vec = np.random.randn(self.num_chain, self.z_size)
+                g_res = sess.run(self.gen_res, feed_dict={self.z: z_vec})
+                # Step D1: obtain synthesized images Y
+                if self.t1 > 0:
+                    syn = sess.run(self.langevin_descriptor, feed_dict={self.syn: g_res})
+                # Step G1: update X using Y as training image
+                #if self.t2 > 0:
+                #    z_vec = sess.run(self.langevin_generator, feed_dict={self.z: z_vec, self.obs: syn})
+
+                # variational inference
+
+
+                # Step D2: update D net
+                d_loss = sess.run([self.des_loss, self.des_loss_update, self.apply_d_grads],
+                                  feed_dict={self.obs: obs_data, self.syn: syn})[0]
+
+                # Step G2: update VAE net
+                vae_loss = sess.run([self.vae_loss, self.vae_loss_update, self.apply_vae_grads],
+                                  feed_dict={self.obs: syn, self.syn: syn})[0]
+
+
+                # Step G2: update G net
+                #g_loss = sess.run([self.gen_loss, self.gen_loss_update, self.apply_g_grads],
+                #                  feed_dict={self.obs: syn, self.z: z_vec})[0]
+
+                # Compute MSE
+                mse = sess.run([self.recon_err, self.recon_err_update],
+                               feed_dict={self.obs: obs_data, self.syn: syn})[0]
+
+                sample_results_gen[i * self.num_chain:(i + 1) * self.num_chain] = g_res
+                sample_results_des[i * self.num_chain:(i + 1) * self.num_chain] = syn
+
+
+            end_time = time.time()
+            #[des_loss_avg, gen_loss_avg, mse_avg, summary] = sess.run([self.des_loss_mean, self.gen_loss_mean,
+            #                                                           self.recon_err_mean, self.summary_op])
+
+            [des_loss_avg, vae_loss_avg, mse_avg, summary] = sess.run([self.des_loss_mean, self.vae_loss_mean,
+                                                                       self.recon_err_mean, self.summary_op])
+
+            [decayed_lr_d, decayed_lr_vae] = sess.run([self.decayed_learning_rate_d, self.decayed_learning_rate_vae])
+
+            writer.add_summary(summary, minibatch)
+            writer.flush()
+            print('Epoch #{:d}, avg.des loss: {:.4f}, avg.vae loss: {:.4f}, '
+                  'avg.L2 dist: {:4.4f}, time: {:.2f}s, learning rate: EBM {:.6f}, VAE {:.6f}'.format(epoch, des_loss_avg, vae_loss_avg,
+                  mse_avg, end_time - start_time, decayed_lr_d, decayed_lr_vae))
+
+            #print('Epoch #{:d}, avg.des loss: {:.4f}, avg.vae loss: {:.4f}, '
+            #      'avg.L2 dist: {:4.4f}, time: {:.2f}s'.format(epoch, des_loss_avg, vae_loss_avg,
+            #      mse_avg, end_time - start_time))
+
+            # save synthesis images
+            if not os.path.exists(self.sample_dir):
+                os.makedirs(self.sample_dir)
+            saveSampleResults(syn, "%s/des_%06d_%06d.png" % (self.sample_dir, epoch, minibatch), col_num=self.nTileCol)
+            saveSampleResults(g_res, "%s/gen_%06d_%06d.png" % (self.sample_dir, epoch, minibatch), col_num=self.nTileCol)
+
+            if epoch % self.log_step == 0:
+                # save check points
+                if not os.path.exists(self.model_dir):
+                    os.makedirs(self.model_dir)
+                saver.save(sess, "%s/%s" % (self.model_dir, 'model.ckpt'), global_step=epoch)
+
+            if self.calculate_inception and epoch % 5 == 0:
+
+                sample_results_partial = sample_results_des[:len(dataset)]
+                sample_results_partial = np.minimum(1, np.maximum(-1, sample_results_partial))
+                sample_results_partial = (sample_results_partial + 1) / 2 * 255
+
+                m, s = get_inception_score(sample_results_partial)
+                print("Inception score: mean {}, sd {}".format(m, s))
+                fo = open(inception_log_file, 'a')
+                fo.write("Epoch {}: mean {}, sd {} \n".format(epoch, m, s))
+                fo.close()
+                inception_mean.append(m)
+                inception_sd.append(s)
+                sio.savemat(inception_write_file, {'mean': np.asarray(inception_mean), 'sd': np.asarray(inception_sd)})
+
+            if self.calculate_parzen:
+
+                samples_des = sample_results_des[:10000]
+                samples_gen = sample_results_gen[:10000]
+
+                parzon_des_mean, parzon_des_se, parzon_gen_mean, parzon_gen_se = kde.eval_parzen(samples_des, samples_gen)
+
+                parzon_des_mean_list.append(parzon_des_mean)
+                parzon_des_se_list.append(parzon_des_se)
+                parzon_gen_mean_list.append(parzon_gen_mean)
+                parzon_gen_se_list.append(parzon_gen_se)
+
+                if parzon_des_mean > parzon_max:
+                    parzon_max = parzon_des_mean
+                    sio.savemat(parzon_syn_data_file, {'samples_des': samples_des, 'samples_gen': samples_gen})
+
+                fo = open(parzon_log_file, 'a')
+                fo.write("Epoch {}: des mean {}, sd {}; gen mean {}, sd {}, max score {}. \n".
+                         format(epoch, parzon_des_mean, parzon_des_se, parzon_gen_mean, parzon_gen_se, parzon_max))
+                fo.close()
+
+                sio.savemat(parzon_write_file, {'parzon_des_mean': np.asarray(parzon_des_mean_list),
+                                                'parzon_des_se': np.asarray(parzon_des_se_list),
+                                                'parzon_gen_mean': np.asarray(parzon_gen_mean_list),
+                                                'parzon_gen_se': np.asarray(parzon_gen_se_list)})
+
+
+
+
+
+    def interpolation(self, sess, ckpt, sample_size, useTraining=False):
+        assert ckpt is not None, 'no checkpoint provided.'
+
+        if useTraining:
+            dataset = DataSet(self.data_path, image_size=self.image_size, batch_sz=self.batch_size,
+                              prefetch=self.prefetch, read_len=self.read_len, is_mnist=False)
+
+        obs_res = self.descriptor(self.obs, reuse=False)
+        gen_res = self.generator(self.z, reuse=False)
+        get_codes = self.encoder(self.obs, reuse=False)[0]
+        langevin_descriptor = self.langevin_dynamics_descriptor(self.obs)
+        num_batches = int(math.ceil(sample_size / self.num_chain))
+
+        saver = tf.train.Saver()
+
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, ckpt)
+        print('Loading checkpoint {}.'.format(ckpt))
+
+        for i in xrange(num_batches):
+
+            if useTraining:
+                obs_data = dataset.get_batch()
+                num_get = np.min([self.num_chain, np.shape(obs_data)[0]])
+                obs_data = obs_data[:num_get, :, :, :]
+                z_vec = sess.run(get_codes, feed_dict={self.obs: obs_data})
+            else:
+                z_vec = np.random.randn(self.num_chain, self.z_size)
+            # g_res = sess.run(gen_res, feed_dict={self.z: z_vec})
+            # saveSampleResults(g_res, "%s/gen%03d.png" % (self.test_dir, i), col_num=self.nTileCol)
+
+            # output interpolation results
+            interp_z = linear_interpolator(z_vec, npairs=self.nTileRow, ninterp=self.nTileCol)
+            interp = sess.run(gen_res, feed_dict={self.z: interp_z})
+
+            interp = sess.run(langevin_descriptor, feed_dict={self.obs: interp})
+            saveSampleResults(interp, "%s/interp%03d.png" % (self.test_dir, i), col_num=self.nTileCol)
+
+        print("The results are saved in a folder: {}".format(self.test_dir))
+
+    def sampling(self, sess, ckpt, sample_size, sample_step, calculate_inception=False):
+        assert ckpt is not None, 'no checkpoint provided.'
+
+        self.t1 = sample_step
+
+        gen_res = self.generator(self.z, reuse=False)
+        obs_res = self.descriptor(self.obs, reuse=False)
+
+        self.langevin_descriptor = self.langevin_dynamics_descriptor(gen_res)
+        num_batches = int(math.ceil(sample_size / self.num_chain))
+
+        saver = tf.train.Saver()
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, ckpt)
+        print('Loading checkpoint {}.'.format(ckpt))
+
+        sample_results_des = np.random.randn(self.num_chain * num_batches, self.image_size, self.image_size, self.num_channel)
+        for i in xrange(num_batches):
+            z_vec = np.random.randn(self.num_chain, self.z_size)
+
+            # synthesis by generator
+            g_res = sess.run(gen_res, feed_dict={self.z: z_vec})
+            saveSampleResults(g_res, "%s/gen%03d_test.png" % (self.test_dir, i), col_num=self.nTileCol)
+
+            # synthesis by descriptor and generator
+            syn = sess.run(self.langevin_descriptor, feed_dict={self.z: z_vec})
+            saveSampleResults(syn, "%s/des%03d_test.png" % (self.test_dir, i), col_num=self.nTileCol)
+
+            sample_results_des[i * self.num_chain:(i + 1) * self.num_chain] = syn
+
+            if i % 10 == 0:
+                print("Sampling batches: {}, from {} to {}".format(i, i * self.num_chain,
+                                                                   min((i+1) * self.num_chain, sample_size)))
+        sample_results_des = sample_results_des[:sample_size]
+        sample_results_des = np.minimum(1, np.maximum(-1, sample_results_des))
+        sample_results_des = (sample_results_des + 1) / 2 * 255
+
+        if calculate_inception:
+            m, s = get_inception_score(sample_results_des)
+            print("Inception score: mean {}, sd {}".format(m, s))
+
+        sampling_output_file = os.path.join(self.output_dir, 'samples_des.npy')
+        np.save(sampling_output_file, sample_results_des)
+        print("The results are saved in folder: {}".format(self.output_dir))
+
+
+    def visualize_refinement(self, sess, ckpt, num_batches=1):
+        assert ckpt is not None, 'no checkpoint provided.'
+
+        gen_res = self.generator(self.z, reuse=False)
+        obs_res = self.descriptor(self.obs, reuse=False)
+
+       # num_batches = int(math.ceil(sample_size / self.num_chain))
+
+        saver = tf.train.Saver()
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, ckpt)
+        print('Loading checkpoint {}.'.format(ckpt))
+
+        #sample_results_des = np.random.randn(self.num_chain * num_batches, self.image_size, self.image_size, self.num_channel)
+        total_images = np.random.randn(self.t1, self.num_chain, self.image_size, self.image_size,  self.num_channel)
+        for i in xrange(num_batches):
+
+            z_vec = np.random.randn(self.num_chain, self.z_size)
+
+            # synthesis by generator
+            g_res = sess.run(gen_res, feed_dict={self.z: z_vec})
+            saveSampleResults(g_res, "%s/%03d_batch_0_step.png" % (self.test_dir, i), col_num=self.nTileCol)
+
+            total_steps = self.t1
+            for j in xrange(total_steps):
+                self.t1 = j+1
+                langevin_descriptor = self.langevin_dynamics_descriptor(self.obs)
+                syn = sess.run(langevin_descriptor, feed_dict={self.obs: g_res})
+                total_images[j,:,:,:,:] = syn
+                saveSampleResults(syn, "%s/%03d_batch_%03d_step.png" % ( self.test_dir, i, j+1), col_num=self.nTileCol)
+
+            refinement_visualization = np.random.randn( self.nTileRow * self.nTileCol, self.image_size, self.image_size, self.num_channel)
+
+            for j in xrange(self.nTileRow):
+                refinement_visualization[j  *self.nTileCol ,:,:,:] = g_res[j, :, :, :]
+
+                for k in xrange(total_steps):
+
+                    refinement_visualization[j *self.nTileCol + 1 + k, : , :, : ] = total_images[k, j, :, :, :]
+
+                #for k in xrange(int(total_steps/2)):
+                    #refinement_visualization[j *self.nTileCol + 1 + k, : , :, : ] = total_images[k*2, j, :, :, :]
+
+
+            saveSampleResults(refinement_visualization, "%s/%03d_batch_final.png" % (self.test_dir, i), col_num=self.nTileRow)
+
+        print("The results are saved in folder: {}".format(self.test_dir))
+
+
+    def inpaint(self, sess, ckpt, num_batches=1):
+        assert ckpt is not None, 'no checkpoint provided.'
+
+        dataset = DataSet(self.data_path, image_size=self.image_size, batch_sz=self.batch_size,
+                          prefetch=self.prefetch, read_len=self.read_len, is_mnist=False)
+
+        obs_res = self.descriptor(self.obs, reuse=False)
+        inference  = self.encoder(self.obs, reuse=False)[0]
+        gen = self.generator(self.z, reuse=False)
+
+        langevin_descriptor = self.langevin_dynamics_descriptor(self.obs)
+
+        visible_map = tf.placeholder(shape=[None, self.image_size, self.image_size, self.num_channel], dtype=tf.float32, name='visible')
+
+
+        #num_batches = int(math.ceil(sample_size / self.batch_size))
+
+        saver = tf.train.Saver()
+
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, ckpt)
+        print('Loading checkpoint {}.'.format(ckpt))
+        inference_Langevin = self.langevin_dynamics_generator_recovery(self.z, visible_map)
+
+        images = np.random.randn(self.num_chain, self.image_size, self.image_size, self.num_channel)
+
+
+        for i in xrange(num_batches):
+
+            obs_data = dataset.get_batch()
+            num_get = np.min([self.nTileRow, np.shape(obs_data)[0]])
+            obs_data = obs_data[:num_get,:,:,:]
+            mask_data = obs_data
+            mask_data[:, int(self.image_size/2):,:,:]=0
+
+            mask_data = np.tile(mask_data, (self.nTileCol, 1, 1, 1))
+
+            # vae + Langevin
+            code = sess.run(inference, feed_dict={self.obs: mask_data})
+            decode = sess.run(gen, feed_dict={self.z: code})
+            recover_data1 = sess.run(langevin_descriptor, feed_dict={self.obs: decode})
+            recover_data1[:, :int(self.image_size / 2), :, :] = mask_data[:, :int(self.image_size / 2), :, :]
+
+            # Langevin only
+            recover_data2 = sess.run(langevin_descriptor, feed_dict={self.obs: mask_data})
+            recover_data2[:, :int(self.image_size / 2), :, :] = mask_data[:, :int(self.image_size / 2), :, :]
+
+
+            #recover_data2[:, :int(self.image_size / 2), :, :] = mask_data[:, :int(self.image_size / 2), :, :]
+
+            # Langevin inference
+            initialize_z = np.random.randn(self.num_chain, self.z_size)
+            visible_map_input = np.zeros(shape=mask_data.shape)
+            visible_map_input[:, :int(self.image_size/2),:,:] = 1
+            code_Langevin = sess.run(inference_Langevin, feed_dict={self.z: initialize_z, self.obs: mask_data, visible_map: visible_map_input})
+
+            decode_Langevin = sess.run(gen, feed_dict={self.z: code_Langevin})
+            decode_Langevin[:, :int(self.image_size / 2), :, :] = mask_data[:, :int(self.image_size / 2), :, :]
+            recover_data3 = sess.run(langevin_descriptor, feed_dict={self.obs: decode_Langevin})
+            recover_data3[:, :int(self.image_size / 2), :, :] = mask_data[:, :int(self.image_size / 2), :, :]
+
+            #
+
+            saveSampleResults(decode_Langevin, "%s/inpaint_decode_Langevin%03d.png" % (self.test_dir, i), col_num=self.nTileRow)
+
+            #saveSampleResults(recover_data1, "%s/inpaint_VAE_EBM%03d.png" % (self.test_dir, i), col_num=self.nTileRow)
+
+            #saveSampleResults(recover_data2, "%s/inpaint_EBM%03d.png" % (self.test_dir, i), col_num=self.nTileRow)
+
+            saveSampleResults(recover_data3, "%s/inpaint_Lengevin_inference_EBM%03d.png" % (self.test_dir, i), col_num=self.nTileRow)
+
+        print("The results are saved in a folder: {}".format(self.test_dir))
+
+    def reconstruction(self, sess, ckpt, num_batches=3):
+        assert ckpt is not None, 'no checkpoint provided.'
+
+        dataset = DataSet(self.data_path, image_size=self.image_size, batch_sz=self.num_chain,
+                          prefetch=self.prefetch, read_len=self.read_len, is_mnist=False)
+
+        obs_res = self.descriptor(self.obs, reuse=False)
+        inference  = self.encoder(self.obs, reuse=False)[0]
+        gen = self.generator(self.z, reuse=False)
+
+        langevin_descriptor = self.langevin_dynamics_descriptor(self.obs)
+
+
+        saver = tf.train.Saver()
+
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, ckpt)
+        print('Loading checkpoint {}.'.format(ckpt))
+        #inference_Langevin = self.langevin_dynamics_generator_recovery(self.z, visible_map)
+
+        #images = np.random.randn(self.num_chain, self.image_size, self.image_size, self.num_channel)
+
+        for i in xrange(num_batches):
+
+            obs_data = dataset.get_batch()
+            #num_get = np.min([self.nTileRow, np.shape(obs_data)[0]])
+
+            # vae + Langevin
+            encode = sess.run(inference, feed_dict={self.obs: obs_data})
+            decode = sess.run(gen, feed_dict={self.z: encode})
+
+            saveSampleResults(decode, "%s/reconstruction_gen%03d.png" % (self.test_dir, i),
+                              col_num=self.nTileRow)
+
+            refined = sess.run(langevin_descriptor, feed_dict={self.obs: decode})
+
+            saveSampleResults(refined, "%s/reconstruction_refined%03d.png" % (self.test_dir, i),
+                              col_num=self.nTileRow)
+
+            saveSampleResults(obs_data, "%s/reconstruction_obs%03d.png" % (self.test_dir, i),
+                              col_num=self.nTileRow)
+
+
+        print("The results are saved in a folder: {}".format(self.test_dir))
+
+
+    def descriptor(self, inputs, reuse=False):
+        with tf.variable_scope('des', reuse=reuse):
+
+            if self.descriptor_type == 'scene':
+
+                out = tf.layers.conv2d(inputs, 64, kernel_size=(5, 5), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+            elif self.descriptor_type == 'cifar':
+
+                out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
+
+                out = tf.layers.conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+            elif self.descriptor_type == 'cifar_2':
+
+                out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
+
+                out = tf.layers.conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+            elif self.descriptor_type == 'cifar_2_song':
+
+                out = tf.layers.conv2d(inputs, 96, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv1')
+
+                out = tf.layers.conv2d(out, 96, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv2')
+
+                out = tf.layers.conv2d(out, 96, kernel_size=(3, 3), strides=(2, 2), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv3')
+
+                out = tf.layers.conv2d(out, 192, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv4')
+
+                out = tf.layers.conv2d(out, 192, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv5')
+
+                out = tf.layers.conv2d(out, 192, kernel_size=(3, 3), strides=(2, 2), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv6')
+
+                out = tf.layers.conv2d(out, 192, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv7')
+
+                out = tf.layers.conv2d(out, 192, kernel_size=(1, 1), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv8')
+
+                out = tf.layers.conv2d(out, 192, kernel_size=(1, 1), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv9')
+
+
+                out = tf.layers.conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+
+
+                # out = conv(inputs, 96, kernel=3, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv1')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 96, kernel=3, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv2')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 96, kernel=3, stride=2, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv3')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 192, kernel=3, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv4')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 192, kernel=3, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv5')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 192, kernel=3, stride=2, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv6')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 192, kernel=3, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv7')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 192, kernel=1, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv8')
+                # out = tf.nn.elu(out)
+                # out = conv(out, 192, kernel=1, stride=1, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv9')
+                # out = tf.nn.elu(out)
+                # out = conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='VALID', activate_fn=None, name="fc")
+                return out
+
+            elif self.descriptor_type == 'cifar_2_elu':
+
+                out = tf.layers.conv2d(inputs, 64, kernel_size=(5, 5), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.leaky_relu, name='conv1')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(5, 5), strides=(2, 2), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.leaky_relu, name='conv2')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(5, 5), strides=(2, 2), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.leaky_relu, name='conv3')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(5, 5), strides=(2, 2), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.leaky_relu, name='conv4')
+
+                out = tf.layers.conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+
+            elif self.descriptor_type == 'cifar_2_elu_pooling':
+
+                out = tf.layers.conv2d(inputs, 128, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv1')
+
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv2')
+
+                out = tf.layers.AveragePooling2D(pool_size=(2, 2), strides=(2, 2), padding="same")(out)
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv3')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv4')
+
+                out = tf.layers.AveragePooling2D(pool_size=(2, 2), strides=(2, 2), padding="same")(out)
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv5')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(2, 2), padding='same',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005),
+                                       activation=tf.nn.elu, name='conv6')
+
+                out = tf.layers.conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                                       kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+            elif self.descriptor_type == 'SA':
+
+                is_training = True
+                #out = dilated_conv2d(input_, 64, kernel=(3, 3), rate=2, padding='SAME', activate_fn=None, name='dil_conv1')
+                out = conv2d(inputs, 64, kernal=(3, 3), strides=(1, 1), padding='SAME', activate_fn=None, name="conv1")
+                out = tf.contrib.layers.batch_norm(out, is_training=is_training)
+                out = leaky_relu(out)
+
+                #out = dilated_conv2d(out, 128, kernel=(2, 2), rate=2, padding='SAME', activate_fn=None, name='dil_conv2')
+                #out = conv2d(out, 128, kernal=(1, 1), strides=(2, 2), padding='SAME', activate_fn=None, name="conv2")
+                out = conv2d(out, 128, kernal=(4, 4), strides=(2, 2), padding='SAME', activate_fn=None, name="conv2")
+                out = tf.contrib.layers.batch_norm(out, is_training=is_training)
+                out = leaky_relu(out)
+
+                #out = non_local_block_sim(out, name="SA_1")
+
+                #out = dilated_conv2d(out, 256, kernel=(2, 2), rate=2, padding='SAME', activate_fn=None, name='dil_conv3')
+                #out = conv2d(out, 256, kernal=(1, 1), strides=(2, 2), padding='SAME', activate_fn=None, name="conv3")
+                out = conv2d(out, 256, kernal=(4, 4), strides=(2, 2), padding='SAME', activate_fn=None, name="conv3")
+
+                out = tf.contrib.layers.batch_norm(out, is_training=is_training)
+                out = leaky_relu(out)
+
+                #out = non_local_block_sim(out, name="SA_2")
+
+                #out = dilated_conv2d(out, 256, kernel=(2, 2), rate=2, padding='SAME', activate_fn=None, name='dil_conv4')
+                out = conv2d(out, 256, kernal=(4, 4), strides=(2, 2), padding='SAME', activate_fn=None, name="conv4")
+                out = tf.contrib.layers.batch_norm(out, is_training=is_training)
+                out = leaky_relu(out)
+
+                out = conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='VALID', activate_fn=None, name="fc")
+                out = tf.contrib.layers.batch_norm(out, is_training=is_training)
+                out = leaky_relu(out)
+
+
+
+
+
+                #out = non_local_block_sim(out, name="SA_2")
+                #convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                #out = leaky_relu(out)
+
+                return out
+
+            elif self.descriptor_type == 'cifar1':
+
+                out = tf.layers.conv2d(inputs, 64, kernel_size=(5, 5), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(3, 3), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+            elif self.descriptor_type == 'mnist':
+
+                out = tf.layers.conv2d(inputs, 64, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                return out
+
+            else:
+                return NotImplementedError
+
+    def encoder(self, inputs, reuse=False):
+        with tf.variable_scope('VAE', reuse=reuse):
+
+            if self.encoder_type == 'cifar':
+
+                 out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                 out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                 out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                 out = tf.layers.conv2d(out, 512, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
+
+                 #out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                 #kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                 out = tf.contrib.layers.flatten(out)
+                 mn = tf.layers.dense(out, units=self.z_size)
+                 sd = 0.5 * tf.layers.dense(out, units=self.z_size)
+                 epsilon = tf.random_normal(tf.stack([tf.shape(out)[0], self.z_size]))
+                 z = mn + tf.multiply(epsilon, tf.exp(sd))
+
+            elif self.encoder_type == 'cifar_2':
+
+                 out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                 out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                 out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                 out = tf.layers.conv2d(out, 512, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
+
+                 #out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                 #kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                 out = tf.contrib.layers.flatten(out)
+                 mn = tf.layers.dense(out, units=self.z_size)
+                 sd = 0.5 * tf.layers.dense(out, units=self.z_size)
+                 epsilon = tf.random_normal(tf.stack([tf.shape(out)[0], self.z_size]))
+                 z = mn + tf.multiply(epsilon, tf.exp(sd))
+
+            elif self.encoder_type == 'SA':
+
+                 out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                 out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                 out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                 out = tf.layers.conv2d(out, 512, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
+
+                 #out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
+                 #kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
+
+                 out = tf.contrib.layers.flatten(out)
+                 mn = tf.layers.dense(out, units=self.z_size)
+                 sd = 0.5 * tf.layers.dense(out, units=self.z_size)
+                 epsilon = tf.random_normal(tf.stack([tf.shape(out)[0], self.z_size]))
+                 z = mn + tf.multiply(epsilon, tf.exp(sd))
+
+            else:
+
+                 out = tf.layers.conv2d(inputs, 64, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
+
+                 out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
+
+                 out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
+
+                 out = tf.layers.conv2d(out, 512, kernel_size=(4, 4), strides=(2, 2), padding='same',
+                 kernel_initializer=tf.initializers.random_normal(stddev=0.005),  activation=tf.nn.leaky_relu, name='conv4')
+
+                 out = tf.contrib.layers.flatten(out)
+                 mn = tf.layers.dense(out, units=self.z_size)
+                 sd = 0.5 * tf.layers.dense(out, units=self.z_size)
+                 epsilon = tf.random_normal(tf.stack([tf.shape(out)[0], self.z_size]))
+                 z = mn + tf.multiply(epsilon, tf.exp(sd))
+
+            return z, mn, sd
+
+    def generator(self, inputs, reuse=False, is_training=True):
+        with tf.variable_scope('VAE', reuse=reuse):
+            if self.generator_type == 'scene':
+
+                inputs = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt1 = convt2d(inputs, (None, self.image_size // 16, self.image_size // 16, 512), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt1")
+                convt1 = tf.contrib.layers.batch_norm(convt1, is_training=is_training)
+                convt1 = leaky_relu(convt1)
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(5, 5)
+                                 , strides=(2, 2), padding="SAME", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt3 = convt2d(convt2, (None, self.image_size // 4, self.image_size // 4, 128), kernal=(5, 5)
+                                 , strides=(2, 2), padding="SAME", name="convt3")
+                convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                convt3 = leaky_relu(convt3)
+
+                convt4 = convt2d(convt3, (None, self.image_size // 2, self.image_size // 2, 64), kernal=(5, 5)
+                                 , strides=(2, 2), padding="SAME", name="convt4")
+                convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
+                convt4 = leaky_relu(convt4)
+
+                convt5 = convt2d(convt4, (None, self.image_size, self.image_size, self.num_channel), kernal=(5, 5)
+                                 , strides=(2, 2), padding="SAME", name="convt5")
+                convt5 = tf.nn.tanh(convt5)
+
+                return convt5
+
+            elif self.generator_type == 'cifar':
+
+                convt1 = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt3 = convt2d(convt2, (None, self.image_size // 4, self.image_size // 4, 128), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt3")
+                convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                convt3 = leaky_relu(convt3)
+
+                convt4 = convt2d(convt3, (None, self.image_size // 2, self.image_size // 2, 64), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt4")
+                convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
+                convt4 = leaky_relu(convt4)
+
+                convt5 = convt2d(convt4, (None, self.image_size, self.image_size, self.num_channel), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt5")
+                convt5 = tf.nn.tanh(convt5)
+
+                return convt5
+
+            elif self.generator_type == 'cifar_2':
+
+                convt1 = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt3 = convt2d(convt2, (None, self.image_size // 4, self.image_size // 4, 128), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt3")
+                convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                convt3 = leaky_relu(convt3)
+
+                convt4 = convt2d(convt3, (None, self.image_size // 2, self.image_size // 2, 64), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt4")
+                convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
+                convt4 = leaky_relu(convt4)
+
+                convt5 = convt2d(convt4, (None, self.image_size, self.image_size, 64), kernal=(3, 3)
+                                 , strides=(2, 2), padding="SAME", name="convt5")
+                convt5 = leaky_relu(convt5)
+
+                convt6 = convt2d(convt5, (None, self.image_size, self.image_size, self.num_channel), kernal=(3, 3)
+                                 , strides=(1, 1), padding="SAME", name="convt6")
+                convt6 = tf.nn.tanh(convt6)
+
+                return convt6
+
+            elif self.generator_type == 'cifar_2_convt2d':
+
+                convt1 = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt3 = convt2d(convt2, (None, self.image_size // 4, self.image_size // 4, 128), kernal=(3, 3)
+                                 , strides=(2, 2), padding="SAME", name="convt3")
+                convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                convt3 = leaky_relu(convt3)
+
+                convt4 = convt2d(convt3, (None, self.image_size // 2, self.image_size // 2, 64), kernal=(3, 3)
+                                 , strides=(2, 2), padding="SAME", name="convt4")
+                convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
+                convt4 = leaky_relu(convt4)
+
+                convt5 = convt2d(convt4, (None, self.image_size, self.image_size, 64), kernal=(3, 3)
+                                 , strides=(2, 2), padding="SAME", name="convt5")
+                convt5 = tf.contrib.layers.batch_norm(convt5, is_training=is_training)
+                convt5 = leaky_relu(convt5)
+
+                convt6 = convt2d(convt5, (None, self.image_size, self.image_size, self.num_channel), kernal=(3, 3)
+                                 , strides=(1, 1), padding="SAME", name="convt6")
+                convt6 = tf.nn.tanh(convt6)
+
+                return convt6
+
+
+
+
+            elif self.generator_type == 'cifar_2_conv2d_up':
+
+                convt1 = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                conv3 = conv2d(convt2, 128, kernal=(3, 3), strides = (1, 1), name='conv3')
+                conv3 = usample(conv3)
+                conv3 = tf.contrib.layers.batch_norm(conv3, is_training=is_training)
+                conv3 = leaky_relu(conv3)
+
+                conv4 = conv2d(conv3, 64, kernal=(3, 3), strides=(1, 1), name='conv4')
+                conv4 = usample(conv4)
+                conv4 = tf.contrib.layers.batch_norm(conv4, is_training=is_training)
+                conv4 = leaky_relu(conv4)
+
+                conv5 = conv2d(conv4, 64, kernal=(3, 3), strides=(1, 1), name='conv5')
+                conv5 = usample(conv5)
+                conv5 = tf.contrib.layers.batch_norm(conv5, is_training=is_training)
+                conv5 = leaky_relu(conv5)
+
+                conv6 = conv2d(conv5, 3, kernal=(3, 3), strides=(1, 1), name='conv6')
+                conv6 = tf.nn.tanh(conv6)
+
+                return conv6
+
+            elif self.generator_type == 'cifar_2_dil_conv2d_up':
+
+                convt1 = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                conv3 = dilated_conv2d(convt2, 128, kernel=(3, 3), rate=2, padding='SAME', activate_fn=None, name='dil_conv1')
+                #conv3 = conv2d(convt2, 128, kernal=(3, 3), strides = (1, 1), name='conv3')
+                conv3 = usample(conv3)
+                conv3 = tf.contrib.layers.batch_norm(conv3, is_training=is_training)
+                conv3 = leaky_relu(conv3)
+
+                conv4 = dilated_conv2d(conv3, 64, kernel=(3, 3), rate=2, padding='SAME', activate_fn=None, name='dil_conv2')
+                #conv4 = conv2d(conv3, 64, kernal=(3, 3), strides=(1, 1), name='conv4')
+                conv4 = usample(conv4)
+                conv4 = tf.contrib.layers.batch_norm(conv4, is_training=is_training)
+                conv4 = leaky_relu(conv4)
+
+                conv5 = dilated_conv2d(conv4, 64, kernel=(3, 3), rate=2, padding='SAME', activate_fn=None, name='dil_conv3')
+                #conv5 = conv2d(conv4, 64, kernal=(3, 3), strides=(1, 1), name='conv5')
+                conv5 = usample(conv5)
+                conv5 = tf.contrib.layers.batch_norm(conv5, is_training=is_training)
+                conv5 = leaky_relu(conv5)
+
+                conv6 = dilated_conv2d(conv5, 3, kernel=(3, 3), rate=2, padding='SAME', activate_fn=None, name='dil_conv4')
+                #conv6 = conv2d(conv5, 3, kernal=(3, 3), strides=(1, 1), name='conv6')
+                conv6 = tf.nn.tanh(conv6)
+
+                return conv6
+
+            elif self.generator_type == 'SA':
+
+                convt1 = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt2 = convt2d(convt1, (None, self.image_size // 8, self.image_size // 8, 256), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt2 = non_local_block_sim(convt2, name="SA_4")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt3 = convt2d(convt2, (None, self.image_size // 4, self.image_size // 4, 128), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt3")
+                convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                convt3 = leaky_relu(convt3)
+
+                #convt3 = non_local_block_sim(convt3, name="SA_4")
+                #convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                #convt3 = leaky_relu(convt3)
+
+
+                convt4 = convt2d(convt3, (None, self.image_size // 2, self.image_size // 2, 64), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt4")
+                convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
+                convt4 = leaky_relu(convt4)
+
+                convt5 = convt2d(convt4, (None, self.image_size, self.image_size, 64), kernal=(3, 3)
+                                 , strides=(2, 2), padding="SAME", name="convt5")
+                convt5 = leaky_relu(convt5)
+
+                convt6 = convt2d(convt5, (None, self.image_size, self.image_size, self.num_channel), kernal=(3, 3)
+                                 , strides=(1, 1), padding="SAME", name="convt6")
+                convt6 = tf.nn.tanh(convt6)
+
+                return convt6
+
+            elif self.generator_type == 'residual':
+
+                inputs = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+
+                convt1 = convt2d(inputs, (None, 4, 4, 512), kernal=(4, 4), strides=(1, 1), padding="VALID", name="convt1")
+
+                convt2 = residual_block(convt1, 256, "convt2")
+
+                convt3 = residual_block(convt2, 128, "convt3")
+
+                convt4 = residual_block(convt3, 64, "convt4")
+
+                convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
+                convt4 = leaky_relu(convt4)
+
+                convt5 = convt2d(convt4, (None, self.image_size, self.image_size, 64), kernal=(3, 3)
+                                 , strides=(1, 1), padding="SAME", name="convt5")
+                convt5 = tf.contrib.layers.batch_norm(convt5, is_training=is_training)
+                convt5 = leaky_relu(convt5)
+
+                convt6 = convt2d(convt5, (None, self.image_size, self.image_size, self.num_channel), kernal=(3, 3)
+                                 , strides=(1, 1), padding="SAME", name="convt6")
+
+                #convt5 = conv2d(convt4, 3, kernal=(3, 3), strides=(1, 1), name='conv5')
+
+                convt6 = tf.nn.tanh(convt6)
+
+                return convt6
+
+
+            elif self.generator_type == 'mnist':
+
+                inputs = tf.reshape(inputs, [-1, 1, 1, self.z_size])
+                convt1 = convt2d(inputs, (None, 4, 4, 512), kernal=(4, 4)
+                                 , strides=(1, 1), padding="VALID", name="convt1")
+                convt1 = tf.contrib.layers.batch_norm(convt1, is_training=is_training)
+                convt1 = leaky_relu(convt1)
+
+                convt2 = convt2d(convt1, (None, 7, 7, 256), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt2")
+                convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
+                convt2 = leaky_relu(convt2)
+
+                convt3 = convt2d(convt2, (None, 14, 14, 128), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt3")
+                convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
+                convt3 = leaky_relu(convt3)
+
+                convt4 = convt2d(convt3, (None, self.image_size, self.image_size, self.num_channel), kernal=(4, 4)
+                                 , strides=(2, 2), padding="SAME", name="convt5")
+                convt4 = tf.nn.tanh(convt4)
+
+                return convt4
+
+            else:
+                return NotImplementedError

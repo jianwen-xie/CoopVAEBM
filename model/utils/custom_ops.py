@@ -1,0 +1,447 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import tensorflow as tf
+from model.utils.data_io import *
+import scipy.misc
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import BytesIO
+
+def image_summary(tag, images, row_num=10, col_num=10, margin_syn=2):
+    cell_images = img2cell(images, row_num=row_num, col_num=col_num, margin_syn=margin_syn)
+    cell_image = cell_images[0]
+    try:
+        s = StringIO()
+    except:
+        s = BytesIO()
+    Image.fromarray(cell_image).save(s, format="png")
+    # scipy.misc.toimage(cell_image).save(s, format="png")
+    img_sum = tf.Summary.Image(encoded_image_string=s.getvalue(), height=cell_image.shape[0], width=cell_image.shape[1])
+    return tf.Summary(value=[tf.Summary.Value(tag=tag, image=img_sum)])
+
+
+def leaky_relu(input_, leakiness=0.2):
+    assert leakiness <= 1
+    return tf.maximum(input_, leakiness * input_)
+
+
+def dilated_conv2d(input_, output_dim, kernel=(5, 5), rate=1, padding='SAME', activate_fn=None, name='dil_conv2d'):
+
+    if type(kernel) == list or type(kernel) == tuple:
+        [k_h, k_w] = list(kernel)
+    else:
+        k_h = k_w = kernel
+
+    with tf.variable_scope(name):
+        if type(padding) == list or type(padding) == tuple:
+            padding = [0] + list(padding) + [0]
+            input_ = tf.pad(input_, [[p, p] for p in padding], "CONSTANT")
+            padding = 'VALID'
+        w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim],
+                            initializer=tf.random_normal_initializer(stddev=0.01))
+
+        conv = tf.nn.atrous_conv2d(input_, w, rate, padding=padding)
+        biases = tf.get_variable('biases', [output_dim], initializer=tf.constant_initializer(0.0))
+        conv = tf.nn.bias_add(conv, biases)
+        if activate_fn:
+            conv = activate_fn(conv)
+        return conv
+
+def conv2d(input_, output_dim, kernal=(5, 5), strides=(2, 2), padding='SAME', activate_fn=None, name="conv2d"):
+    if type(kernal) == list or type(kernal) == tuple:
+        [k_h, k_w] = list(kernal)
+    else:
+        k_h = k_w = kernal
+    if type(strides) == list or type(strides) == tuple:
+        [d_h, d_w] = list(strides)
+    else:
+        d_h = d_w = strides
+
+    with tf.variable_scope(name):
+        if type(padding) == list or type(padding) == tuple:
+            padding = [0] + list(padding) + [0]
+            input_ = tf.pad(input_, [[p, p] for p in padding], "CONSTANT")
+            padding = 'VALID'
+
+        w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim],
+                            initializer=tf.random_normal_initializer(stddev=0.01))
+        conv = tf.nn.conv2d(input_, w, strides=[1, d_h, d_w, 1], padding=padding)
+        biases = tf.get_variable('biases', [output_dim], initializer=tf.constant_initializer(0.0))
+        conv = tf.nn.bias_add(conv, biases)
+        if activate_fn:
+            conv = activate_fn(conv)
+        return conv
+
+def fully_connected(input_, output_dim, name="fc"):
+    shape = input_.shape
+    return conv2d(input_, output_dim, kernal=list(shape[1:3]), strides=(1, 1), padding="VALID", name=name)
+
+def convt2d(input_, output_shape, kernal=(5, 5), strides=(2, 2), padding='SAME', activate_fn=None, name="convt2d"):
+    assert type(kernal) in [list, tuple, int]
+    assert type(strides) in [list, tuple, int]
+    assert type(padding) in [list, tuple, int, str]
+    if type(kernal) == list or type(kernal) == tuple:
+        [k_h, k_w] = list(kernal)
+    else:
+        k_h = k_w = kernal
+    if type(strides) == list or type(strides) == tuple:
+        [d_h, d_w] = list(strides)
+    else:
+        d_h = d_w = strides
+    output_shape = list(output_shape)
+    output_shape[0] = tf.shape(input_)[0]
+    with tf.variable_scope(name):
+        if type(padding) in [tuple, list, int]:
+            if type(padding) == int:
+                p_h = p_w = padding
+            else:
+                [p_h, p_w] = list(padding)
+            pad_ = [0, p_h, p_w, 0]
+            input_ = tf.pad(input_, [[p, p] for p in pad_], "CONSTANT")
+            padding = 'VALID'
+
+        w = tf.get_variable('w', [k_h, k_w, output_shape[-1], input_.get_shape()[-1]],
+                            initializer=tf.random_normal_initializer(stddev=0.005))
+        convt = tf.nn.conv2d_transpose(input_, w, output_shape=tf.stack(output_shape, axis=0), strides=[1, d_h, d_w, 1],
+                                       padding=padding)
+        biases = tf.get_variable('biases', [output_shape[-1]], initializer=tf.constant_initializer(0.0))
+        convt = tf.nn.bias_add(convt, biases)
+        if activate_fn:
+            convt = activate_fn(convt)
+        return convt
+
+def usample(x):
+    _, nh, nw, nx = x.get_shape().as_list()
+    x = tf.image.resize_nearest_neighbor(x, [nh * 2, nw * 2])
+    return x
+
+
+def residual_block(x, out_channels, name):
+
+    with tf.variable_scope(name):
+
+        x_0 = x
+        x = tf.nn.relu(x)
+        x = usample(x)
+        x = conv2d(x, out_channels, kernal = (3, 3), strides = (1, 1), name='conv1')
+        x = tf.nn.relu(x)
+        x = conv2d(x, out_channels, kernal=(3, 3), strides=(1, 1), name='conv2')
+        x_0 = usample(x_0)
+        x_0 = conv2d(x_0, out_channels, kernal=(1, 1), strides=(1, 1), name='conv3')
+
+        return x_0 + x
+
+def residual_block_ebm(x, out_channels, name):
+
+    with tf.variable_scope(name):
+
+
+
+        x1 = conv2d(x, x.get_shape()[3], kernal = (3, 3), strides = (1, 1), name='conv1')
+        x1 = tf.nn.relu(x1)
+        x2 = conv2d(x1, out_channels, kernal=(3, 3), strides=(2, 2), name='conv2')
+        x2 = tf.nn.relu(x2)
+
+        skip = conv2d(x, out_channels, kernal=(3, 3), strides=(2, 2), name='conv3')
+
+        return (skip + x2)/ 1.4
+
+
+def _l2normalize(v, eps=1e-12):
+    """l2 normize the input vector."""
+    return v / (tf.reduce_sum(v ** 2) ** 0.5 + eps)
+
+
+
+def spectral_normed_weight(weights, num_iters=1, update_collection=None,
+                           with_sigma=False):
+    """Performs Spectral Normalization on a weight tensor.
+    Specifically it divides the weight tensor by its largest singular value. This
+    is intended to stabilize GAN training, by making the discriminator satisfy a
+    local 1-Lipschitz constraint.
+    Based on [Spectral Normalization for Generative Adversarial Networks][sn-gan]
+    [sn-gan] https://openreview.net/pdf?id=B1QRgziT-
+    Args:
+    weights: The weight tensor which requires spectral normalization
+    num_iters: Number of SN iterations.
+    update_collection: The update collection for assigning persisted variable u.
+                       If None, the function will update u during the forward
+                       pass. Else if the update_collection equals 'NO_OPS', the
+                       function will not update the u during the forward. This
+                       is useful for the discriminator, since it does not update
+                       u in the second pass.
+                       Else, it will put the assignment in a collection
+                       defined by the user. Then the user need to run the
+                       assignment explicitly.
+    with_sigma: For debugging purpose. If True, the fuction returns
+                the estimated singular value for the weight tensor.
+    Returns:
+    w_bar: The normalized weight tensor
+    sigma: The estimated singular value for the weight tensor.
+    """
+    w_shape = weights.shape.as_list()
+    w_mat = tf.reshape(weights, [-1, w_shape[-1]])  # [-1, output_channel]
+    u = tf.get_variable('u', [1, w_shape[-1]],
+                      initializer=tf.truncated_normal_initializer(),
+                      trainable=False)
+    u_ = u
+    for _ in range(num_iters):
+        v_ = _l2normalize(tf.matmul(u_, w_mat, transpose_b=True))
+        u_ = _l2normalize(tf.matmul(v_, w_mat))
+
+    sigma = tf.squeeze(tf.matmul(tf.matmul(v_, w_mat), u_, transpose_b=True))
+    w_mat /= sigma
+    if update_collection is None:
+        with tf.control_dependencies([u.assign(u_)]):
+            w_bar = tf.reshape(w_mat, w_shape)
+    else:
+        w_bar = tf.reshape(w_mat, w_shape)
+        if update_collection != 'NO_OPS':
+            tf.add_to_collection(update_collection, u.assign(u_))
+    if with_sigma:
+        return w_bar, sigma
+    else:
+        return w_bar
+
+
+def spectral_norm(w, iteration=1):
+   w_shape = w.shape.as_list()
+   w = tf.reshape(w, [-1, w_shape[-1]])
+
+   u = tf.get_variable("u", [1, w_shape[-1]], initializer=tf.random_normal_initializer(), trainable=False)
+
+   u_hat = u
+   v_hat = None
+   for i in range(iteration):
+       """
+       power iteration
+       Usually iteration = 1 will be enough
+       """
+       v_ = tf.matmul(u_hat, tf.transpose(w))
+       v_hat = tf.nn.l2_normalize(v_, dim=None)
+
+       u_ = tf.matmul(v_hat, w)
+       u_hat = tf.nn.l2_normalize(u_, dim=None)
+
+   u_hat = tf.stop_gradient(u_hat)
+   v_hat = tf.stop_gradient(v_hat)
+
+   sigma = tf.matmul(tf.matmul(v_hat, w), tf.transpose(u_hat))
+
+   with tf.control_dependencies([u.assign(u_hat)]):
+       w_norm = w / sigma
+       w_norm = tf.reshape(w_norm, w_shape)
+
+
+   return w_norm
+
+weight_init = tf.random_normal_initializer(mean=0.0, stddev=0.005)
+weight_regularizer = None
+def conv(x, channels, kernel=4, stride=2, pad=0, pad_type='zero', use_bias=True, sn=False, scope='conv_0'):
+    with tf.variable_scope(scope):
+        if pad_type == 'zero' :
+            x = tf.pad(x, [[0, 0], [pad, pad], [pad, pad], [0, 0]])
+        if pad_type == 'reflect' :
+            x = tf.pad(x, [[0, 0], [pad, pad], [pad, pad], [0, 0]], mode='REFLECT')
+
+        if sn :
+            w = tf.get_variable("kernel", shape=[kernel, kernel, x.get_shape()[-1], channels], initializer=weight_init,
+                                regularizer=weight_regularizer)
+            bias = tf.get_variable("bias", [channels], initializer=tf.constant_initializer(0.0))
+            x = tf.nn.conv2d(input=x, filter=spectral_norm(w),
+                             strides=[1, stride, stride, 1], padding='SAME')
+            if use_bias :
+                x = tf.nn.bias_add(x, bias)
+
+        else :
+            x = tf.layers.conv2d(inputs=x, filters=channels,
+                                 kernel_size=kernel, kernel_initializer=weight_init,
+                                 kernel_regularizer=weight_regularizer,
+                                 strides=stride, use_bias=use_bias)
+
+
+
+        return x
+
+
+
+def conv1x1(input_, output_dim, init=tf.contrib.layers.xavier_initializer(), name='conv1x1'):
+    k_h = 1
+    k_w = 1
+    d_h = 1
+    d_w = 1
+    with tf.variable_scope(name):
+        w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim], initializer=init)
+        conv = tf.nn.conv2d(input_, w, strides=[1, d_h, d_w, 1], padding='SAME')
+        return conv
+
+def sn_conv1x1(input_, output_dim, update_collection, init=tf.contrib.layers.xavier_initializer(), name='sn_conv1x1'):
+    with tf.variable_scope(name):
+        k_h = 1
+        k_w = 1
+        d_h = 1
+        d_w = 1
+        w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim], initializer=init)
+        w_bar = spectral_normed_weight(w, num_iters=1, update_collection=update_collection)
+        conv = tf.nn.conv2d(input_, w_bar, strides=[1, d_h, d_w, 1], padding='SAME')
+        return conv
+
+def sn_non_local_block_sim(x, update_collection, name, init=tf.contrib.layers.xavier_initializer()):
+
+    with tf.variable_scope(name):
+        batch_size, h, w, num_channels = x.get_shape().as_list()
+        location_num = h * w
+        downsampled_num = location_num // 4
+
+        # theta path
+        theta = sn_conv1x1(x, num_channels // 8, update_collection, init, 'sn_conv_theta')
+        theta = tf.reshape(theta, [-1, location_num, num_channels // 8])
+
+        # phi path
+        phi = sn_conv1x1(x, num_channels // 8, update_collection, init, 'sn_conv_phi')
+        phi = tf.layers.max_pooling2d(inputs=phi, pool_size=[2, 2], strides=2)
+        phi = tf.reshape(phi, [-1, downsampled_num, num_channels // 8])
+
+
+        attn = tf.matmul(theta, phi, transpose_b=True)
+        attn = tf.nn.softmax(attn)
+        print(tf.reduce_sum(attn, axis=-1))
+
+        # g path
+        g = sn_conv1x1(x, num_channels // 2, update_collection, init, 'sn_conv_g')
+        g = tf.layers.max_pooling2d(inputs=g, pool_size=[2, 2], strides=2)
+        g = tf.reshape(g, [-1, downsampled_num, num_channels // 2])
+
+        attn_g = tf.matmul(attn, g)
+        attn_g = tf.reshape(attn_g, [-1, h, w, num_channels // 2])
+
+        sigma = tf.get_variable('sigma_ratio', [], initializer=tf.constant_initializer(0.0))
+        attn_g = sn_conv1x1(attn_g, num_channels, update_collection, init, 'sn_conv_attn')
+        return x + sigma * attn_g
+
+
+def non_local_block_sim(x, name, init=tf.contrib.layers.xavier_initializer()):
+
+    with tf.variable_scope(name):
+
+        batch_size, h, w, num_channels = x.get_shape().as_list()
+        location_num = h * w
+        downsampled_num = location_num // 4
+
+        # theta path
+        theta = conv1x1(x, num_channels // 8, init, 'conv_theta')
+        theta = tf.reshape(theta, [-1, location_num, num_channels // 8])
+
+        # phi path
+        phi = conv1x1(x, num_channels // 8, init, 'conv_phi')
+        #phi = tf.layers.max_pooling2d(inputs=phi, pool_size=[2, 2], strides=2)
+        phi = tf.reshape(phi, [-1, location_num, num_channels // 8])
+
+        attn = tf.matmul(theta, phi, transpose_b=True)
+        attn = tf.nn.softmax(attn)
+        print(tf.reduce_sum(attn, axis=-1))
+
+        # g path
+        g = conv1x1(x, num_channels // 2, init, 'conv_g')
+        #g = tf.layers.max_pooling2d(inputs=g, pool_size=[2, 2], strides=2)
+        g = tf.reshape(g, [-1, location_num, num_channels // 2])
+
+        attn_g = tf.matmul(attn, g)
+        attn_g = tf.reshape(attn_g, [-1, h, w, num_channels // 2])
+
+        sigma = tf.get_variable('sigma_ratio', [], initializer=tf.constant_initializer(0.0))
+        attn_g = conv1x1(attn_g, num_channels, init, 'conv_attn')
+        return x + sigma * attn_g
+
+
+def non_local_block_sim_old(x, name, init=tf.contrib.layers.xavier_initializer()):
+    with tf.variable_scope(name):
+        batch_size, h, w, num_channels = x.get_shape().as_list()
+        location_num = h * w
+        downsampled_num = location_num // 4
+
+        # theta path
+        theta = conv1x1(x, num_channels // 8, init, 'conv_theta')
+        theta = tf.reshape(theta, [-1, location_num, num_channels // 8])
+
+        # phi path
+        phi = conv1x1(x, num_channels // 8, init, 'conv_phi')
+        phi = tf.layers.max_pooling2d(inputs=phi, pool_size=[2, 2], strides=2)
+        phi = tf.reshape(phi, [-1, downsampled_num, num_channels // 8])
+
+        attn = tf.matmul(theta, phi, transpose_b=True)
+        attn = tf.nn.softmax(attn)
+        print(tf.reduce_sum(attn, axis=-1))
+
+        # g path
+        g = conv1x1(x, num_channels // 2, init, 'conv_g')
+        g = tf.layers.max_pooling2d(inputs=g, pool_size=[2, 2], strides=2)
+        g = tf.reshape(g, [-1, downsampled_num, num_channels // 2])
+
+        attn_g = tf.matmul(attn, g)
+        attn_g = tf.reshape(attn_g, [-1, h, w, num_channels // 2])
+
+        sigma = tf.get_variable('sigma_ratio', [], initializer=tf.constant_initializer(0.0))
+        attn_g = conv1x1(attn_g, num_channels, init, 'conv_attn')
+        return x + sigma * attn_g
+
+
+def snlinear(x, output_size, bias_start=0.0,
+             sn_iters=1, update_collection=None, name='snlinear'):
+    """Creates a spectral normalized linear layer.
+    Args:
+    x: 2D input tensor (batch size, features).
+    output_size: Number of features in output of layer.
+    bias_start: The bias parameters are initialized to this value
+    sn_iters: Number of SN iterations.
+    update_collection: The update collection used in spectral_normed_weight
+    name: Optional, variable scope to put the layer's parameters into
+    Returns:
+    The normalized tensor
+    """
+    shape = x.get_shape().as_list()
+
+    with tf.variable_scope(name):
+        matrix = tf.get_variable(
+            'Matrix', [shape[1], output_size], tf.float32,
+            tf.contrib.layers.xavier_initializer())
+        matrix_bar = spectral_normed_weight(matrix, num_iters=sn_iters,
+                                            update_collection=update_collection)
+        bias = tf.get_variable(
+            'bias', [output_size], initializer=tf.constant_initializer(bias_start))
+        out = tf.matmul(x, matrix_bar) + bias
+        return out
+
+
+def snconv2d(input_, output_dim,
+             k_h=3, k_w=3, d_h=2, d_w=2,
+             sn_iters=1, update_collection=None, padding='SAME', name='snconv2d'):
+    """Creates a spectral normalized (SN) convolutional layer.
+    Args:
+    input_: 4D input tensor (batch size, height, width, channel).
+    output_dim: Number of features in the output layer.
+    k_h: The height of the convolutional kernel.
+    k_w: The width of the convolutional kernel.
+    d_h: The height stride of the convolutional kernel.
+    d_w: The width stride of the convolutional kernel.
+    sn_iters: The number of SN iterations.
+    update_collection: The update collection used in spectral_normed_weight.
+    name: The name of the variable scope.
+    Returns:
+    conv: The normalized tensor.
+    """
+
+
+    with tf.variable_scope(name):
+        w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim],
+            initializer=tf.contrib.layers.xavier_initializer())
+        w_bar = spectral_normed_weight(w, num_iters=sn_iters, update_collection=update_collection)
+
+        conv = tf.nn.conv2d(input_, w_bar, strides=[1, d_h, d_w, 1], padding=padding)
+        biases = tf.get_variable('biases', [output_dim],
+                                 initializer=tf.zeros_initializer())
+        conv = tf.nn.bias_add(conv, biases)
+        return conv

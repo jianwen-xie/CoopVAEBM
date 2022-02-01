@@ -33,10 +33,10 @@ python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifa
 
 
 ```bash
-python main.py --test True --test_type 'interp' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'
+python main.py --test True --test_type 'inter' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'
 ```
 
-<p align="center"><img src="/demo/inter.png" width="700px"/></p>
+<p align="center"><img src="/demo/interp.png" width="700px"/></p>
 
 ## References
     @inproceedings{xie2021learning,

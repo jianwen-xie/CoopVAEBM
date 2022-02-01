@@ -1,6 +1,9 @@
 # CoopVAEBM
 Cooperative learning of energy-based model and variational auto-encoder
 
+This repository contains a pytorch implementation for the paper "[Learning energybased model with variational auto-encoder as amortized sampler](https://arxiv.org/pdf/2012.14936.pdf)" AAAI 2021.
+
+
 ## Installation
 
 
@@ -24,6 +27,7 @@ python main.py --test False
 ```bash
 python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'
 ```
+<p align="center"><img src="/examples/syn.png" width="700px"/></p>
 
 ## Exp 3: Interpolation with a pretrained model
 
@@ -32,3 +36,12 @@ python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifa
 python main.py --test True --test_type 'inter' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'
 ```
 
+<p align="center"><img src="/examples/inter.png" width="700px"/></p>
+
+## References
+    @inproceedings{xie2021learning,
+        title={Learning energybased model with variational auto-encoder as amortized sampler},
+        author={Xie, Jianwen and Zheng, Zilong and Li, Ping},
+        booktitle={The Thirty-Fifth AAAI Conference on Artificial Intelligence (AAAI)},
+        year={2021}
+    }

@@ -13,7 +13,9 @@ conda activate coopvaebm
 conda install tensorflow-gpu==1.12.0
 conda install Pillow    
 ```
-    
+
+Download the checkpoint from [here](www.stat.ucla.edu/~jxie/CoopVAEBM/coopvaebm_file/code/checkpoints.zip)
+
 ## Exp 1: Training
 
 
@@ -23,7 +25,7 @@ python main.py --test False
 
 ## Exp 2: Synthesis with a pretrained model
 
-Download the checkpoint from [here](https://www.stat.ucla.edu/~jxie/CoopVAEBM/coopvaebm_file/code/checkpoints.zip)
+
 
 ```bash
 python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'

@@ -14,7 +14,7 @@ conda install tensorflow-gpu==1.12.0
 conda install Pillow    
 ```
 
-Download the checkpoint from [here](www.stat.ucla.edu/~jxie/CoopVAEBM/coopvaebm_file/code/checkpoints.zip)
+Download the checkpoint from [here](http://www.stat.ucla.edu/~jxie/CoopVAEBM/coopvaebm_file/code/checkpoints.zip)
 
 ## Exp 1: Training
 

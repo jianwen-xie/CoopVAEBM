@@ -23,6 +23,7 @@ python main.py --test False
 
 ## Exp 2: Synthesis with a pretrained model
 
+Download the checkpoint from [here](https://www.stat.ucla.edu/~jxie/CoopVAEBM/coopvaebm_file/code/checkpoints.zip)
 
 ```bash
 python main.py --test True --test_type 'syn' --ckpt 'pretrained/checkpoints/cifar/model.ckpt-3000'

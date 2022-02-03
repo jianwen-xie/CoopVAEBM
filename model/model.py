@@ -8,17 +8,17 @@ from six.moves import xrange
 
 from model.utils.interpolate import *
 from model.utils.custom_ops import *
-from model.utils.data_io import DataSet, saveSampleResults
+from model.utils.data_io import DataSetLoader, saveSampleResults
 from model.utils.parzen_ll import ParsenDensityEsimator
 from model.utils.inception_model import *
-from model.utils.cifar_loader import CifarDataset
+
 from model.modules import *
 
 import scipy.io as sio
 import model.utils.fid_util2 as fid_util
 
 class CoopVAEBM(object):
-    def __init__(self, num_epochs=200, image_size=64, batch_size=100, nTileRow=12, nTileCol=12,
+    def __init__(self, num_epochs=200, image_size=64, batch_size=100, num_channel=3, nTileRow=12, nTileCol=12,
                  descriptor_type='SA', generator_type='SA', encoder_type='SA',
                  d_lr=0.001, vae_lr=0.0001, beta1_vae=0.5, beta1_des=0.5,
                  des_step_size=0.002, des_sample_steps=10, des_refsig=0.016,
@@ -40,7 +40,7 @@ class CoopVAEBM(object):
         self.prefetch = prefetch
         self.read_len = read_len
         self.category = category
-        self.num_channel = 3
+        self.num_channel = num_channel
         self.calculate_inception = calculate_inception
         self.calculate_FID = calculate_FID
         self.output_dir = output_dir
@@ -196,12 +196,8 @@ class CoopVAEBM(object):
         self.build_model()
 
         # Prepare training data
-        is_mnist = False
-        #dataset = DataSet(self.data_path, image_size=self.image_size, batch_sz=self.batch_size,
-        #                  prefetch=self.prefetch, read_len=self.read_len, is_mnist=is_mnist)
 
-        dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
-                               batch_sz=self.batch_size, max_dataset_size=float('inf'))
+        dataset = DataSetLoader(self)
 
         # initialize training
         sess.run(tf.global_variables_initializer())
@@ -321,6 +317,13 @@ class CoopVAEBM(object):
                     fo.write("Epoch {}: FID {} \n".format(epoch, fid_ebm))
                     fo.close()
 
+            elif epoch % 25 == 0:
+
+                if not os.path.exists(self.sample_dir):
+                    os.makedirs(self.sample_dir)
+                saveSampleResults(syn, "%s/des_%06d.png" % (self.sample_dir, epoch), col_num=self.nTileCol)
+                saveSampleResults(g_res, "%s/gen_%06d.png" % (self.sample_dir, epoch), col_num=self.nTileCol)
+
 
     def val_generation(self, sess, epoch, num_examples):
 
@@ -371,8 +374,7 @@ class CoopVAEBM(object):
 
 
         # Prepare training data
-        dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
-                               batch_sz=self.batch_size, max_dataset_size=float('inf'))
+        dataset = DataSetLoader(self)
 
         # initialize training
 
@@ -510,8 +512,7 @@ class CoopVAEBM(object):
         assert ckpt is not None, 'no checkpoint provided.'
 
         if useTraining:
-            dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
-                                   batch_sz=self.batch_size, max_dataset_size=float('inf'))
+            dataset = DataSetLoader(self)
 
         obs_res = self.descriptor(self.obs, self.descriptor_type, reuse=False)
         gen_res = self.generator(self.z, self.generator_type, self.image_size, reuse=False)
@@ -590,9 +591,7 @@ class CoopVAEBM(object):
             print("Inception score: mean {}, sd {}".format(m, s))
 
         if calculate_FID:
-
-            dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
-                                   batch_sz=self.batch_size, max_dataset_size=float('inf'))
+            dataset = DataSetLoader(self)
 
             obs_partial = dataset.images[:len(sample_results_des)]
 
@@ -659,8 +658,7 @@ class CoopVAEBM(object):
     def inpaint(self, sess, ckpt, num_batches=1):
         assert ckpt is not None, 'no checkpoint provided.'
 
-        dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
-                               batch_sz=self.batch_size, max_dataset_size=float('inf'))
+        dataset = DataSetLoader(self)
 
         obs_res = self.descriptor(self.obs, self.descriptor_type, reuse=False)
         inference  = self.encoder(self.obs, self.encoder_type, self.z_size, reuse=False)[0]
@@ -730,8 +728,7 @@ class CoopVAEBM(object):
     def reconstruction(self, sess, ckpt, num_batches=3):
         assert ckpt is not None, 'no checkpoint provided.'
 
-        dataset = CifarDataset(os.path.join(self.data_path, 'cifar_dataset', 'cifar-10-batches-py'), shuffle=True,
-                               batch_sz=self.batch_size, max_dataset_size=float('inf'))
+        dataset = DataSetLoader(self)
 
         obs_res = self.descriptor(self.obs, self.descriptor_type, reuse=False)
         inference  = self.encoder(self.obs, self.encoder_type, self.z_size, reuse=False)[0]

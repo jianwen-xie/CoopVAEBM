@@ -14,11 +14,17 @@ from model.model import CoopVAEBM
 FLAGS = tf.app.flags.FLAGS
 
 # learning parameters
-tf.flags.DEFINE_string('descriptor_type', 'cifar_2', 'descriptor / EBM network type: [scene/mnist/cifar]') # ebm
-tf.flags.DEFINE_string('generator_type', 'cifar_2', 'generator network type: [scene/mnist/cifar]')   # generator model
-tf.flags.DEFINE_string('encoder_type', 'cifar_2', 'encoder network type: [scene/mnist/cifar]')       # inference model
+tf.flags.DEFINE_string('descriptor_type', 'cifar', 'descriptor / EBM network type: [scene/mnist/cifar]') # ebm
+tf.flags.DEFINE_string('generator_type', 'cifar', 'generator network type: [scene/mnist/cifar]')   # generator model
+tf.flags.DEFINE_string('encoder_type', 'cifar', 'encoder network type: [scene/mnist/cifar]')       # inference model
 
-tf.flags.DEFINE_integer('image_size', 32, 'Image size to rescale images') # 64 for scene, and 28 for mnist
+#tf.flags.DEFINE_string('descriptor_type', 'mnist', 'descriptor network type: [scene/mnist/cifar]')
+#tf.flags.DEFINE_string('generator_type', 'mnist2', 'generator network type: [scene/mnist/cifar]')
+#tf.flags.DEFINE_string('encoder_type', 'mnist_web', 'encoder network type: [scene/mnist/cifar]')
+
+
+tf.flags.DEFINE_integer('image_size', 32, 'Image size to rescale images') # 28 for mnist, 32 for cifar10
+tf.flags.DEFINE_integer('num_channel', 3, 'number of channel') # 1 for mnist, 3 for cifar10
 tf.flags.DEFINE_integer('batch_size', 250, 'Batch size of training images')
 tf.flags.DEFINE_integer('num_epochs', 5000, 'Number of epochs to train')
 tf.flags.DEFINE_integer('nTileRow', 30, 'Row number of synthesized images')
@@ -47,9 +53,9 @@ tf.flags.DEFINE_integer('gen_latent_size', 100, 'Number of dimensions of latent 
 
 # utils
 tf.flags.DEFINE_string('data_dir', './data', 'The data directory')
-tf.flags.DEFINE_string('category', 'cifar', 'The name of dataset')
+tf.flags.DEFINE_string('category', 'cifar', 'The name of dataset: [cifar/mnist/mnist-fashion]')
 tf.flags.DEFINE_boolean('prefetch', True, 'True if reading all images at once')
-tf.flags.DEFINE_boolean('calculate_inception', True, 'True if inception score is calculated')
+tf.flags.DEFINE_boolean('calculate_inception', False, 'True if inception score is calculated')
 tf.flags.DEFINE_boolean('calculate_FID', False, 'True if FID score is calculated')
 tf.flags.DEFINE_integer('read_len', 500, 'Number of batches per reading')
 tf.flags.DEFINE_string('output_dir', './output', 'The output directory for saving results')
@@ -57,7 +63,7 @@ tf.flags.DEFINE_integer('log_step', 50, 'Number of minibatches to save output re
 
 
 # training or testing
-tf.flags.DEFINE_boolean('test', False, 'True if in testing mode')
+tf.flags.DEFINE_boolean('test', True, 'True if in testing mode')
 tf.flags.DEFINE_string('test_type', 'syn', 'testing type: [inter/syn/recon/visual/finetune]: inpaint: inpainting | inter: interpolation | syn: synthesis |visual: visualization | finetune: finetune the model')
 tf.flags.DEFINE_string('ckpt', 'pretrained/checkpoints/cifar/model.ckpt-3000', 'Checkpoint path to load: e.g., pretrained/checkpoints/cifar/model.ckpt-3000')
 tf.flags.DEFINE_integer('sample_size', 100, 'Number of images to generate during test.')
@@ -99,6 +105,7 @@ def main(_):
         num_epochs=FLAGS.num_epochs,
         image_size=FLAGS.image_size,
         batch_size=FLAGS.batch_size,
+        num_channel=FLAGS.num_channel,
         beta1_des=FLAGS.beta1_des,
         beta1_vae=FLAGS.beta1_vae,
         nTileRow=FLAGS.nTileRow, nTileCol=FLAGS.nTileCol,

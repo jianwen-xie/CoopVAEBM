@@ -21,26 +21,8 @@ def descriptor(inputs, descriptor_type, reuse=False):
 
             return out
 
+
         elif descriptor_type == 'cifar':
-
-            out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
-            kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
-
-            out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
-            kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
-
-            out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
-            kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
-
-            out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
-            kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
-
-            out = tf.layers.conv2d(out, 1, list(out.shape[1:3]), strides=(1, 1), padding='valid',
-            kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
-
-            return out
-
-        elif descriptor_type == 'cifar_2':
 
             out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
             kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
@@ -297,30 +279,8 @@ def descriptor(inputs, descriptor_type, reuse=False):
 def encoder(inputs, encoder_type, z_size, reuse=False):
     with tf.variable_scope('VAE_encoder', reuse=reuse):
 
+
         if encoder_type == 'cifar':
-
-             out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
-             kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
-
-             out = tf.layers.conv2d(out, 128, kernel_size=(4, 4), strides=(2, 2), padding='same',
-             kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv2')
-
-             out = tf.layers.conv2d(out, 256, kernel_size=(4, 4), strides=(2, 2), padding='same',
-             kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv3')
-
-             out = tf.layers.conv2d(out, 512, kernel_size=(4, 4), strides=(2, 2), padding='same',
-             kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv4')
-
-             #out = tf.layers.conv2d(out, 100, list(out.shape[1:3]), strides=(1, 1), padding='valid',
-             #kernel_initializer=tf.initializers.random_normal(stddev=0.005), name='fc')
-
-             out = tf.contrib.layers.flatten(out)
-             mn = tf.layers.dense(out, units=z_size)
-             sd = 0.5 * tf.layers.dense(out, units=z_size)
-             epsilon = tf.random_normal(tf.stack([tf.shape(out)[0], z_size]))
-             z = mn + tf.multiply(epsilon, tf.exp(sd))
-
-        elif encoder_type == 'cifar_2':
 
              out = tf.layers.conv2d(inputs, 64, kernel_size=(3, 3), strides=(1, 1), padding='same',
              kernel_initializer=tf.initializers.random_normal(stddev=0.005), activation=tf.nn.leaky_relu, name='conv1')
@@ -383,9 +343,9 @@ def encoder(inputs, encoder_type, z_size, reuse=False):
              out = tf.contrib.layers.flatten(out)
              mn = tf.layers.dense(out, units=z_size)
 
-             sd = 0.5 * (1e-6 + tf.nn.softplus(tf.layers.dense(out, units=z_size)))
+             # sd = 0.5 * (1e-6 + tf.nn.softplus(tf.layers.dense(out, units=z_size)))
 
-             #sd = 0.5 * tf.layers.dense(out, units=z_size)
+             sd = 0.5 * tf.layers.dense(out, units=z_size)
              epsilon = tf.random_normal(tf.stack([tf.shape(out)[0], z_size]))
              z = mn + tf.multiply(epsilon, tf.exp(sd))
 
@@ -568,32 +528,8 @@ def generator(inputs, generator_type, image_size, reuse=False, is_training=True)
 
             return convt5
 
+
         elif generator_type == 'cifar':
-
-            convt1 = tf.reshape(inputs, [-1, 1, 1, inputs.get_shape()[1]])
-
-            convt2 = convt2d(convt1, (None, image_size // 8, image_size // 8, 256), kernal=(4, 4)
-                             , strides=(1, 1), padding="VALID", name="convt2")
-            convt2 = tf.contrib.layers.batch_norm(convt2, is_training=is_training)
-            convt2 = leaky_relu(convt2)
-
-            convt3 = convt2d(convt2, (None, image_size // 4, image_size // 4, 128), kernal=(4, 4)
-                             , strides=(2, 2), padding="SAME", name="convt3")
-            convt3 = tf.contrib.layers.batch_norm(convt3, is_training=is_training)
-            convt3 = leaky_relu(convt3)
-
-            convt4 = convt2d(convt3, (None, image_size // 2, image_size // 2, 64), kernal=(4, 4)
-                             , strides=(2, 2), padding="SAME", name="convt4")
-            convt4 = tf.contrib.layers.batch_norm(convt4, is_training=is_training)
-            convt4 = leaky_relu(convt4)
-
-            convt5 = convt2d(convt4, (None, image_size, image_size, 3), kernal=(4, 4)
-                             , strides=(2, 2), padding="SAME", name="convt5")
-            convt5 = tf.nn.tanh(convt5)
-
-            return convt5
-
-        elif generator_type == 'cifar_2':
 
             convt1 = tf.reshape(inputs, [-1, 1, 1, inputs.get_shape()[1]])
 

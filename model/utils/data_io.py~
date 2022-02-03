@@ -25,7 +25,7 @@ def DataSetLoader(self):
                              img_width=self.image_size, img_height=self.image_size, shuffle=True, low=-1, high=1, batch_sz=self.batch_size)
 
     elif self.category == "mnist-fashion":
-        dataset = MNISTDataSet(os.path.join(self.data_path, 'mnist-fashion'), MNIST_type=2, train=True, num_images=None,
+        dataset = MNISTDataSet(os.path.join(self.data_path, 'mnist'), MNIST_type=2, train=True, num_images=None,
                                img_width=self.image_size, img_height=self.image_size, shuffle=True, low=-1, high=1, batch_sz=self.batch_size)
     else:
         print("No this dataset.")

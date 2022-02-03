@@ -3,7 +3,7 @@ import numpy as np
 from model.utils.dataset_base import DataSet
 from tensorflow.contrib.learn.python.learn.datasets import base
 from tensorflow.contrib.learn.python.learn.datasets.mnist import extract_images, extract_labels
-import math
+
 
 
 class MNISTDataSet(DataSet):

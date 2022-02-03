@@ -14,10 +14,7 @@ from model.model import CoopVAEBM
 FLAGS = tf.app.flags.FLAGS
 
 # learning parameters
-tf.flags.DEFINE_string('descriptor_type', 'cifar', 'descriptor / EBM network type: [scene/mnist/cifar]') # ebm
-tf.flags.DEFINE_string('generator_type', 'cifar', 'generator network type: [scene/mnist/cifar]')   # generator model
-tf.flags.DEFINE_string('encoder_type', 'cifar', 'encoder network type: [scene/mnist/cifar]')       # inference model
-
+tf.flags.DEFINE_string('net_type', 'cifar', 'network type: [cifar/mnist/mnist-fashion]')
 
 tf.flags.DEFINE_integer('image_size', 32, 'Image size to rescale images') # 28 for mnist, 32 for cifar10
 tf.flags.DEFINE_integer('num_channel', 3, 'number of channel') # 1 for mnist, 3 for cifar10
@@ -59,7 +56,7 @@ tf.flags.DEFINE_integer('log_step', 50, 'Number of minibatches to save output re
 
 
 # training or testing
-tf.flags.DEFINE_boolean('test', True, 'True if in testing mode')
+tf.flags.DEFINE_boolean('test', False, 'True if in testing mode')
 tf.flags.DEFINE_string('test_type', 'syn', 'testing type: [inter/syn/recon/visual/finetune]: inpaint: inpainting | inter: interpolation | syn: synthesis |visual: visualization | finetune: finetune the model')
 tf.flags.DEFINE_string('ckpt', 'pretrained/checkpoints/cifar/model.ckpt-3000', 'Checkpoint path to load: e.g., pretrained/checkpoints/cifar/model.ckpt-3000')
 tf.flags.DEFINE_integer('sample_size', 100, 'Number of images to generate during test.')
@@ -95,9 +92,9 @@ def main(_):
 
     model = CoopVAEBM(
 
-        descriptor_type=FLAGS.descriptor_type,
-        generator_type=FLAGS.generator_type,
-        encoder_type=FLAGS.encoder_type,
+        descriptor_type=FLAGS.net_type,
+        generator_type=FLAGS.net_type,
+        encoder_type=FLAGS.net_type,
         num_epochs=FLAGS.num_epochs,
         image_size=FLAGS.image_size,
         batch_size=FLAGS.batch_size,

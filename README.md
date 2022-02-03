@@ -28,7 +28,7 @@ python main.py --test False
 (2) MNIST dataset
 
 ```bash
-python main.py --test False --category 'mnist' --descriptor_type 'mnist' --generator_type 'mnist' --encoder_type 'mnist' --image_size 16 --num_channel 1 --batch_size 400 --nTileRow 20 --nTileCol 20 --des_step_size 0.001 --des_sample_steps 50 --vae_lr 0.0001 --weight_latent_loss 3
+python main.py --net_type 'mnist' --category 'mnist' --image_size 28 --num_channel 1 --batch_size 400 --nTileRow 20 --nTileCol 20 --des_step_size 0.001 --des_sample_steps 50 --vae_lr 0.0001 --weight_latent_loss 3
 ```
 
 (3) MNIST-fashion dataset

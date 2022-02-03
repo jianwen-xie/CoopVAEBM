@@ -18,10 +18,6 @@ tf.flags.DEFINE_string('descriptor_type', 'cifar', 'descriptor / EBM network typ
 tf.flags.DEFINE_string('generator_type', 'cifar', 'generator network type: [scene/mnist/cifar]')   # generator model
 tf.flags.DEFINE_string('encoder_type', 'cifar', 'encoder network type: [scene/mnist/cifar]')       # inference model
 
-#tf.flags.DEFINE_string('descriptor_type', 'mnist', 'descriptor network type: [scene/mnist/cifar]')
-#tf.flags.DEFINE_string('generator_type', 'mnist2', 'generator network type: [scene/mnist/cifar]')
-#tf.flags.DEFINE_string('encoder_type', 'mnist_web', 'encoder network type: [scene/mnist/cifar]')
-
 
 tf.flags.DEFINE_integer('image_size', 32, 'Image size to rescale images') # 28 for mnist, 32 for cifar10
 tf.flags.DEFINE_integer('num_channel', 3, 'number of channel') # 1 for mnist, 3 for cifar10

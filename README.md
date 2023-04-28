@@ -1,4 +1,5 @@
-# CoopVAEBM
+# CoopVAEBM:  Cooperative Training of Energy-based Model and Variational Auto-Encoder
+
 Cooperative learning of energy-based model and variational auto-encoder
 
 This repository contains a pytorch implementation for the paper "[Learning energybased model with variational auto-encoder as amortized sampler](https://arxiv.org/pdf/2012.14936.pdf)" AAAI 2021.
